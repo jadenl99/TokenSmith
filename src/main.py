@@ -18,6 +18,7 @@ from src.instrumentation.logging import get_logger
 from src.ranking.ranker import EnsembleRanker
 from src.preprocessing.chunking import DocumentChunker
 from src.query_enhancement import generate_hypothetical_document, contextualize_query
+from src.clarification import classify_and_clarify, merge_clarification
 from src.retriever import (
     filter_retrieved_chunks, 
     BM25Retriever, 
@@ -95,6 +96,30 @@ def use_indexed_chunks(question: str, chunks: list) -> list:
         for chunk_id in page_to_chunk_map.get(str(page_no), [])
     }
     return [chunks[cid] for cid in chunk_ids], list(chunk_ids)
+
+def retrieve_chunks_for_clarification(
+    question: str,
+    cfg: RAGConfig,
+    artifacts: Dict,
+    top_k: int = 5,
+) -> List[str]:
+    """
+    Run a lightweight retrieval pass (no HyDE, no rerank) to get the top
+    chunks for a query. 
+    """
+    chunks = artifacts["chunks"]
+    retrievers = artifacts["retrievers"]
+    ranker = artifacts["ranker"]
+
+    pool_n = max(cfg.num_candidates, cfg.top_k + 10)
+    raw_scores: Dict[str, Dict[int, float]] = {}
+    for retriever in retrievers:
+        raw_scores[retriever.name] = retriever.get_scores(question, pool_n, chunks)
+
+    ordered, _ = ranker.rank(raw_scores=raw_scores)
+    topk_idxs = filter_retrieved_chunks(cfg, chunks, ordered)[:top_k]
+    return [chunks[i] for i in topk_idxs]
+
 
 def get_answer(
     question: str,
@@ -313,9 +338,40 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                 break
             
             effective_q = q
+            if cfg.enable_clarification:
+                try:
+                    print("Retrieving chunks to ground ambiguity classification...")
+                    clarification_chunks = retrieve_chunks_for_clarification(q, cfg, artifacts)
+                    print(f"Retrieved {len(clarification_chunks)} chunks for clarification check.")
+                    is_ambiguous, follow_up = classify_and_clarify(q, clarification_chunks, cfg.gen_model)
+                    print(f"Ambiguity classification result: is_ambiguous={is_ambiguous}, follow_up='{follow_up}'")
+                except Exception as e:
+                    print(f"Warning: clarification check failed: {e}. Proceeding with original query.")
+                    is_ambiguous, follow_up = False, None
+
+                if is_ambiguous and follow_up:
+                    console.print(f"\n[bold yellow]Your question seems ambiguous.[/bold yellow] {follow_up}")
+                    console.print("[dim](Press Enter to keep the original question.)[/dim]")
+                    try:
+                        reply = input("Clarify > ").strip()
+                    except EOFError:
+                        reply = ""
+
+                    if reply:
+                        effective_q = merge_clarification(q, reply)
+                        additional_log_info["clarification_triggered"] = True
+                        additional_log_info["clarification_question"] = follow_up
+                        additional_log_info["clarification_reply"] = reply
+                        additional_log_info["clarified_query"] = effective_q
+                        print(f"Clarified Query: {effective_q}")
+                    else:
+                        additional_log_info["clarification_triggered"] = True
+                        additional_log_info["clarification_question"] = follow_up
+                        additional_log_info["clarification_reply"] = None
+
             if cfg.enable_history and chat_history:
                 try:
-                    effective_q = contextualize_query(q, chat_history, cfg.gen_model)
+                    effective_q = contextualize_query(effective_q, chat_history, cfg.gen_model)
                     additional_log_info["is_contextualizing_query"] = True
                     additional_log_info["contextualized_query"] = effective_q
                     additional_log_info["original_query"] = q
