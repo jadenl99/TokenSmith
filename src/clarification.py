@@ -1,5 +1,5 @@
 import textwrap
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from src.generator import run_llama_cpp, text_cleaning
 
@@ -80,7 +80,7 @@ def classify_and_clarify(
 
         Respond in EXACTLY one of these two formats, with no extra text:
         CLEAR
-        AMBIGUOUS: <one short follow-up question to ask the user>
+        AMBIGUOUS: <one short follow-up question that names 2-3 distinct candidate topics drawn from the retrieved chunks and leaves the door open for "any other topic" so the user is never forced to pick from the suggestions; vary the phrasing naturally across cases rather than always using the same dash-separated list>
         <|im_end|>
         <|im_start|>user
         Question: How does strict two-phase locking ensure conflict serializability?
@@ -130,7 +130,12 @@ def classify_and_clarify(
         maintaining the index on inserts and updates.
         <|im_end|>
         <|im_start|>assistant
-        AMBIGUOUS: Which aspect of indexing are you asking about — B+ trees, hash indexes, clustered vs. unclustered, index selection, or any other specific aspect?
+        AMBIGUOUS: "Indexing" covers a lot of ground in this chapter — are you interested in how B+ trees are structured, how hash indexes handle lookups, or the tradeoff between clustered and unclustered indexes? Happy to go somewhere else if none of these fit.<|im_end|>
+        <|im_start|>user
+        Question: Can you explain this concept?
+
+        Retrieved chunks:
+        [Chunk 1]
         The relational model organizes data into relations (tables) with a fixed
         schema of typed attributes.
 
@@ -143,7 +148,7 @@ def classify_and_clarify(
         an existing tuple in another relation.
         <|im_end|>
         <|im_start|>assistant
-        AMBIGUOUS: Which concept would you like me to explain — the relational model, write-ahead logging, foreign key constraints, or any other specific aspect?<|im_end|>
+        AMBIGUOUS: It's not clear what "this concept" refers to — the retrieved passages touch on three unrelated ideas. Did you mean (1) the relational model, (2) write-ahead logging, or (3) foreign key constraints? If it's something else entirely, tell me which topic and I'll focus there.<|im_end|>
         <|im_start|>user
         Question: What is the difference between 3NF and BCNF?
 
@@ -184,7 +189,7 @@ def classify_and_clarify(
         instead validates transactions at commit time.
         <|im_end|>
         <|im_start|>assistant
-        AMBIGUOUS: Which locking topic do you mean — two-phase locking, hierarchical/intention locks, deadlock handling, how it compares to optimistic concurrency control?, or any other specific aspect?<|im_end|>
+        AMBIGUOUS: Locking is a big area; could you narrow it down? I can walk through the two-phase locking protocol, explain how hierarchical/intention locks let you mix coarse and fine granularity, or focus on how deadlocks are detected and resolved — or point me at a different angle if none of those are what you had in mind.<|im_end|>
         <|im_start|>user
         Question: {query}
 
@@ -223,13 +228,85 @@ def classify_and_clarify(
     return False, None
 
 
-def merge_clarification(original_query: str, clarification: str) -> str:
+def merge_clarification(
+        original_query: str,
+        clarification: str,
+        model_path: str,
+        max_tokens: int = 500,
+        **llm_kwargs,
+    ) -> str:
     """
     Combine the original query with the user's clarification into a single
-    standalone query suitable for retrieval.
+    standalone query suitable for retrieval. Uses an LLM to produce a clean
+    rephrasing instead of a raw concatenation, falling back to a simple join
+    on any failure.
     """
     original_query = original_query.strip()
     clarification = clarification.strip()
     if not clarification:
         return original_query
-    return f"{original_query} (clarification: {clarification})"
+    fallback = f"{original_query} (clarification: {clarification})"
+
+    prompt = textwrap.dedent(f"""\
+        <|im_start|>system
+        You are a query rewriting assistant for a database systems textbook Q&A tool.
+        You are given the user's original question and their short clarification reply.
+        Rewrite them into ONE standalone question that:
+        - Incorporates the specific topic or scope from the clarification.
+        - Reads naturally, as if the user had asked it that way originally.
+        - Preserves the intent and question type of the original.
+        - Contains no meta phrasing like "clarification:", "user said", or quotes.
+
+
+        Output ONLY the rewritten question on a single line, with no preamble.
+
+
+        Examples:
+        Original: Tell me about indexing.
+        Clarification: B+ trees
+        Output: Tell me about B+ tree indexing.
+
+
+        Original: How does locking work?
+        Clarification: specifically deadlock detection
+        Output: How does deadlock detection work in database locking?
+
+
+        Original: Can you explain this concept?
+        Clarification: write-ahead logging
+        Output: Can you explain write-ahead logging?
+        <|im_end|>
+        <|im_start|>user
+        Original: {original_query}
+        Clarification: {clarification}
+
+
+        Output:
+        <|im_end|>
+        <|im_start|>assistant
+        """)
+
+    prompt = text_cleaning(prompt)
+    try:
+        output = run_llama_cpp(
+            prompt,
+            model_path,
+            max_tokens=max_tokens,
+            temperature=0.1,
+            **llm_kwargs,
+        )
+        rewritten = output["choices"][0]["text"].strip()
+    except Exception:
+        return fallback
+
+    # Take the first non-empty line to guard against rambling outputs
+    first_line = next((ln.strip() for ln in rewritten.splitlines() if ln.strip()), "")
+    if not first_line:
+        return fallback
+
+    # Guard against hallucinated long outputs
+    max_len = max(len(original_query) + len(clarification) + 40, 200)
+    if len(first_line) > max_len * 2:
+        return fallback
+
+    return first_line

@@ -34,6 +34,8 @@ class RAGConfig:
     max_gen_tokens: int = 400
     gen_model: str = "models/qwen2.5-3b-instruct-q8_0.gguf"
 
+    enable_clarification: bool = True
+    
     # testing
     system_prompt_mode: str = "baseline"
     disable_chunks: bool = False

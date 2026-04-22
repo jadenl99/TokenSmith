@@ -338,12 +338,25 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                 break
             
             effective_q = q
+
+            if cfg.enable_history and chat_history:
+                try:
+                    effective_q = contextualize_query(effective_q, chat_history, cfg.gen_model)
+                    additional_log_info["is_contextualizing_query"] = True
+                    additional_log_info["contextualized_query"] = effective_q
+                    additional_log_info["original_query"] = q
+                    additional_log_info["chat_history"] = chat_history
+                    print(f"Contextualized Query: {effective_q}")  # Debug print to trace contextualization
+                except Exception as e:
+                    print(f"Warning: Failed to contextualize query: {e}. Using original query.")
+                    effective_q = q
+
             if cfg.enable_clarification:
                 try:
                     print("Retrieving chunks to ground ambiguity classification...")
-                    clarification_chunks = retrieve_chunks_for_clarification(q, cfg, artifacts)
+                    clarification_chunks = retrieve_chunks_for_clarification(effective_q, cfg, artifacts)
                     print(f"Retrieved {len(clarification_chunks)} chunks for clarification check.")
-                    is_ambiguous, follow_up = classify_and_clarify(q, clarification_chunks, cfg.gen_model)
+                    is_ambiguous, follow_up = classify_and_clarify(effective_q, clarification_chunks, cfg.gen_model)
                     print(f"Ambiguity classification result: is_ambiguous={is_ambiguous}, follow_up='{follow_up}'")
                 except Exception as e:
                     print(f"Warning: clarification check failed: {e}. Proceeding with original query.")
@@ -358,7 +371,7 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                         reply = ""
 
                     if reply:
-                        effective_q = merge_clarification(q, reply)
+                        effective_q = merge_clarification(effective_q, reply, cfg.gen_model)
                         additional_log_info["clarification_triggered"] = True
                         additional_log_info["clarification_question"] = follow_up
                         additional_log_info["clarification_reply"] = reply
@@ -368,18 +381,6 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                         additional_log_info["clarification_triggered"] = True
                         additional_log_info["clarification_question"] = follow_up
                         additional_log_info["clarification_reply"] = None
-
-            if cfg.enable_history and chat_history:
-                try:
-                    effective_q = contextualize_query(effective_q, chat_history, cfg.gen_model)
-                    additional_log_info["is_contextualizing_query"] = True
-                    additional_log_info["contextualized_query"] = effective_q
-                    additional_log_info["original_query"] = q
-                    additional_log_info["chat_history"] = chat_history
-                    print(f"Contextualized Query: {effective_q}")  # Debug print to trace contextualization
-                except Exception as e:
-                    print(f"Warning: Failed to contextualize query: {e}. Using original query.")
-                    effective_q = q
             
             # Use the single query function. get_answer also renders the streaming markdown and takes care of logging, so we need not do anything else here.
             ans = get_answer(effective_q, cfg, args, logger, console, artifacts=artifacts, additional_log_info=additional_log_info)
